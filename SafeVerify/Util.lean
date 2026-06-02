@@ -1,5 +1,11 @@
-import SafeVerify.Types
+module
+
 import Lean
+public import SafeVerify.Types
+public import Lean.CoreM
+public import Lean.Meta.Basic
+
+public section
 
 open Lean SafeVerify
 
@@ -135,3 +141,5 @@ def checkNegatedTheorem {m} [Monad m] [MonadLiftT CoreM m]
   match Lean.Kernel.isDefEq (← getEnv) (← getLCtx) negatedType cnew.type with
   | .error _ =>  return false
   | .ok bool => return bool
+
+end

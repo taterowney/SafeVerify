@@ -1,5 +1,11 @@
-import SafeVerify.Types
+module
+
 import Lean
+public import Lean.Environment
+
+public import SafeVerify.Types
+
+public section
 
 open Lean
 
@@ -56,3 +62,5 @@ def getDecls {m : Type → Type} [Monad m] : SafeVerifyT m Decls :=
   fun _ => read
 
 end SafeVerify
+
+end

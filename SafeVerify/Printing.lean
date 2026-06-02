@@ -1,4 +1,8 @@
-import SafeVerify.Types
+module
+
+public import SafeVerify.Types
+
+public section
 
 open Lean SafeVerify
 
@@ -13,7 +17,7 @@ def Lean.ConstantInfo.kind : ConstantInfo → String
   | .defnInfo   _ => "def"
   | .thmInfo    _ => "theorem"
   | .opaqueInfo _ => "opaque"
-  | .quotInfo   _ => "quot" -- Not sure what this is!
+  | .quotInfo   _ => "quot"
   | .inductInfo _ => "inductive"
   | .ctorInfo   _ => "constructor"
   | .recInfo    _ => "recursor"
@@ -31,3 +35,5 @@ instance : ToString CheckFailure where
 
 instance : ToString Info where
   toString info := s!"Name: {info.constInfo.name}. Axioms: {info.axioms}."
+
+end

@@ -1,4 +1,9 @@
+module
 import Lean
+public import Lean.Data.Json.FromToJson.Basic
+public import Lean.Declaration
+
+public section
 
 open Lean Meta
 
@@ -56,3 +61,4 @@ structure SafeVerifyOutcome where
 deriving Inhabited, ToJson
 
 end SafeVerify
+end

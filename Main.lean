@@ -157,16 +157,14 @@ def sanitizeConstant : ConstantInfo → ConstantInfo
       value := rebuildExpr o.value }
   | ci => ci
 
-/-- Replays a lean file and outputs a hashmap storing the `Info`s corresponding to
-the theorems and definitions in the file, together with the resulting environment. -/
-def replayFile (filePath : System.FilePath) (disallowPartial : Bool) :
+/-- Replays a module's constants on top of the import-base environment built from that
+module's own imports, and outputs a hashmap storing the `Info`s corresponding to
+the theorems and definitions in the file, together with the resulting environment.
+`mod` and `baseEnv` are supplied by the caller (`runMain`), which reads each olean
+exactly once and builds one import-base environment per distinct import array, so the
+bytes that passed the import superset check are the bytes that get replayed. -/
+def replayModule (mod : ModuleData) (baseEnv : Environment) (disallowPartial : Bool) :
     IO (HashMap Name Info × Environment) := do
-  IO.eprintln s!"Replaying {filePath}"
-  unless (← filePath.pathExists) do
-    throw <| IO.userError s!"object file '{filePath}' does not exist"
-  let (mod, _) ← readModuleData filePath
-  let env ← importModules mod.imports {} 0
-  IO.eprintln "Finished setting up the environment."
   let mut newConstants := {}
   for name in mod.constNames, ci in mod.constants do
     if ci.isUnsafe then
@@ -174,53 +172,9 @@ def replayFile (filePath : System.FilePath) (disallowPartial : Bool) :
     if disallowPartial && ci.isPartial && !isCompilerUnsafeRecName name then
       throw <| IO.userError s!"partial constant {name} detected"
     newConstants := newConstants.insert name (sanitizeConstant ci)
-  let env ← env.replay newConstants
+  let env ← baseEnv.replay newConstants
   IO.eprintln s!"Finished replay. Found {newConstants.size} declarations."
   -- Verify theorem proofs using kernel typechecker with rebuilt expressions.
-  for name in mod.constNames, ci in mod.constants do
-    if let .thmInfo t := ci then
-      let freshValue := rebuildExpr t.value
-      let freshType := rebuildExpr t.type
-      match Kernel.check env {} freshValue with
-      | .ok inferredType =>
-        match Kernel.isDefEq env {} inferredType freshType with
-        | .ok true => pure ()
-        | _ => throw <| IO.userError s!"kernel verification failed for '{name}': inferred type does not match declared type"
-      | .error _ =>
-        throw <| IO.userError s!"kernel verification failed for '{name}': proof term rejected by kernel typechecker (possible unsafeCast or compacted-region corruption)"
-  return (processFileDeclarations env, env)
-
-/-- Replays the target (challenge) file and extracts declarations plus the environment.
-    Reads file path and settings from the Settings context. -/
-def replayChallenges : ReaderT SafeVerify.Settings IO (HashMap Name Info × Environment) := do
-  let settings ← read
-  replayFile settings.targetFile settings.disallowPartial
-
-/-- Replays the submission (solution) file and extracts declarations. -/
-def replaySolutions : ReaderT SafeVerify.Settings IO (HashMap Name Info) := do
-  let settings ← read
-  let (decls, _) ← replayFile settings.submissionFile settings.disallowPartial
-  return decls
-
-/-- Replay a file and return both the new-declaration HashMap AND the full Environment.
-Used for the submission so we can look up imported declarations as a fallback. -/
-def replayFileWithEnv (filePath : System.FilePath) (disallowPartial : Bool)
-    : IO (HashMap Name Info × Environment) := do
-  IO.eprintln s!"Replaying {filePath}"
-  unless (← filePath.pathExists) do
-    throw <| IO.userError s!"object file '{filePath}' does not exist"
-  let (mod, _) ← readModuleData filePath
-  let env ← importModules mod.imports {} 0
-  IO.eprintln "Finished setting up the environment."
-  let mut newConstants := {}
-  for name in mod.constNames, ci in mod.constants do
-    if ci.isUnsafe then
-      throw <| IO.userError s!"unsafe constant {name} detected"
-    if disallowPartial && ci.isPartial && !isCompilerUnsafeRecName name then
-      throw <| IO.userError s!"partial constant {name} detected"
-    newConstants := newConstants.insert name (sanitizeConstant ci)
-  let env ← env.replay newConstants
-  IO.eprintln s!"Finished replay. Found {newConstants.size} declarations."
   for name in mod.constNames, ci in mod.constants do
     if let .thmInfo t := ci then
       let freshValue := rebuildExpr t.value
@@ -245,17 +199,12 @@ def readImports (filePath : System.FilePath) : IO (Array Import) := do
 This prevents attacks where submissions omit imports to redefine types.
 Both sides are resolved to their full transitive module sets (from Environment.header),
 so multi-file repos that transitively include Mathlib pass correctly, and barrel imports
-like `import Mathlib` are expanded to the individual modules they bring in. -/
-def checkImportSuperset (targetFile submissionFile : System.FilePath)
-    (targetImports submissionImports : Array Import) : IO Unit := do
-  -- Both target and submission must import Init
-  unless targetImports.any (·.module == `Init) do
-    throw <| IO.userError s!"Target '{targetFile}' does not import Init. Refusing to verify against a prelude-based target."
-  if submissionImports.isEmpty then
-    throw <| IO.userError s!"'{submissionFile}' has no imports (possible prelude file). Submissions must import Init to prevent kernel type redefinition."
-  -- Build both environments to get transitive module sets
-  let targetEnv ← importModules targetImports {} 0
-  let submissionEnv ← importModules submissionImports {} 0
+like `import Mathlib` are expanded to the individual modules they bring in.
+`targetEnv` and `submissionEnv` are the import-base environments built by `runMain` from
+each file's own import array; the Init/no-imports preconditions are also checked there,
+before any environment is built. -/
+def checkImportSuperset (submissionFile : System.FilePath)
+    (targetEnv submissionEnv : Environment) : IO Unit := do
   let submissionModuleSet : Std.HashSet Name :=
     submissionEnv.header.moduleNames.foldl (init := {}) fun s n => s.insert n
   let mut missing : Array Name := #[]
@@ -416,16 +365,69 @@ def runMain (p : Parsed) : IO UInt32 := do
   let settings := settingsFromParsed p
   IO.eprintln s!"Running SafeVerify on target file: {settings.targetFile} and submission file: {settings.submissionFile}."
 
-  -- Import superset check: submission must import everything the target does
-  let targetImports ← readImports settings.targetFile
-  let submissionImports ← readImports settings.submissionFile
-  checkImportSuperset settings.targetFile settings.submissionFile targetImports submissionImports
+  -- Read each olean's module data exactly once per invocation: the same `mod` feeds both
+  -- the import superset check and that file's replay, so the bytes that are checked are
+  -- the bytes that are replayed.
+  unless (← settings.targetFile.pathExists) do
+    throw <| IO.userError s!"object file '{settings.targetFile}' does not exist"
+  let (targetMod, _) ← readModuleData settings.targetFile
+  unless (← settings.submissionFile.pathExists) do
+    throw <| IO.userError s!"object file '{settings.submissionFile}' does not exist"
+  let (submissionMod, _) ← readModuleData settings.submissionFile
 
-  -- Replay files to get declarations (runs in ReaderT Settings IO)
+  -- Both target and submission must import Init (checked before any environment is built)
+  unless targetMod.imports.any (·.module == `Init) do
+    throw <| IO.userError s!"Target '{settings.targetFile}' does not import Init. Refusing to verify against a prelude-based target."
+  if submissionMod.imports.isEmpty then
+    throw <| IO.userError s!"'{settings.submissionFile}' has no imports (possible prelude file). Submissions must import Init to prevent kernel type redefinition."
+
+  -- Build one import-base environment per distinct import array, scoped to this
+  -- invocation (nothing outlives the process). The two builds collapse to one ONLY when
+  -- the import arrays are fully structurally equal -- `Import`'s derived `BEq` compares
+  -- ALL fields (module, importAll, isExported, isMeta), never just names -- and in that
+  -- case the superset check is mathematically vacuous, so sharing cannot weaken it.
+  -- SAFE_VERIFY_NO_SHARE=1 restores four fully independent builds.
+  let noShare := (← IO.getEnv "SAFE_VERIFY_NO_SHARE") == some "1"
+  let sharedBase := !noShare && targetMod.imports == submissionMod.imports
+  let baseEnvTarget ← importModules targetMod.imports {} 0
+  let baseEnvSubmission ←
+    if sharedBase then do
+      -- Runtime guard at the share point: full structural equality of the import arrays.
+      unless targetMod.imports == submissionMod.imports do
+        throw <| IO.userError "SafeVerify internal error: import-base environment shared without structurally equal import arrays"
+      pure baseEnvTarget
+    else
+      importModules submissionMod.imports {} 0
+
+  -- Import superset check: submission must import everything the target does
+  checkImportSuperset settings.submissionFile baseEnvTarget baseEnvSubmission
+
+  -- Replay files to get declarations
   IO.eprintln "------------------"
-  let (targetDecls, env) ← replayChallenges.run settings
+  IO.eprintln s!"Replaying {settings.targetFile}"
+  let replayBaseTarget ←
+    if noShare then
+      importModules targetMod.imports {} 0
+    else
+      pure baseEnvTarget
+  IO.eprintln "Finished setting up the environment."
+  let (targetDecls, targetEnvReplayed) ←
+    replayModule targetMod replayBaseTarget settings.disallowPartial
   IO.eprintln "------------------"
-  let (submissionDecls, submissionEnv) ← replayFileWithEnv settings.submissionFile settings.disallowPartial
+  IO.eprintln s!"Replaying {settings.submissionFile}"
+  let replayBaseSubmission ←
+    if noShare then
+      importModules submissionMod.imports {} 0
+    else do
+      if sharedBase then
+        -- Runtime guard at the share point: the shared environment may serve the
+        -- submission replay only under full structural equality of the import arrays.
+        unless targetMod.imports == submissionMod.imports do
+          throw <| IO.userError "SafeVerify internal error: shared environment reached the submission replay without structurally equal import arrays"
+      pure baseEnvSubmission
+  IO.eprintln "Finished setting up the environment."
+  let (submissionDecls, submissionEnvReplayed) ←
+    replayModule submissionMod replayBaseSubmission settings.disallowPartial
 
   -- Supplement submissionDecls with imported declarations that the target also defines.
   -- This handles the case where the spec replicates definitions that in the impl are in
@@ -435,10 +437,10 @@ def runMain (p : Parsed) : IO UInt32 := do
   let mut supplementedDecls := submissionDecls
   for (name, _) in targetDecls do
     if submissionDecls.get? name |>.isNone then
-      if let some ci := submissionEnv.find? name then
+      if let some ci := submissionEnvReplayed.find? name then
         if ci.kind ∈ ["theorem", "def", "opaque", "inductive", "constructor"] then
           -- let (_, s) := (CollectAxioms.collect name).run submissionEnv |>.run {}
-          let axioms := runM submissionEnv (Lean.collectAxioms name : CollectM _ )
+          let axioms := runM submissionEnvReplayed (Lean.collectAxioms name : CollectM _ )
           supplementedDecls := supplementedDecls.insert name ⟨ci, axioms⟩
           IO.eprintln s!"  Note: '{name}' found in submission's imported environment"
 
@@ -449,7 +451,7 @@ def runMain (p : Parsed) : IO UInt32 := do
   let decls : SafeVerify.Decls := {
     targetDecls := targetDecls,
     submissionDecls := submissionDecls,
-    env := env
+    env := targetEnvReplayed
   }
 
   -- Run the main SafeVerify check (runs in ReaderT Settings (ReaderT Decls (StateT State IO)))
